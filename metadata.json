@@ -1,0 +1,7 @@
+{
+  "name": "AI Style Mate",
+  "description": "Your personal AI stylist. Upload your wardrobe, get outfit recommendations for any occasion, and find matching pieces to buy.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
