@@ -8,11 +8,30 @@ import { Shirt, Sparkles, ShoppingBag, Menu, X } from 'lucide-react';
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<AppTab>(AppTab.WARDROBE);
   
-  // Initialize wardrobe from localStorage
+  // Initialize wardrobe from localStorage with robust error handling and sanitization
   const [wardrobe, setWardrobe] = useState<ClothingItem[]>(() => {
     try {
       const savedItems = localStorage.getItem("styleMate_wardrobe_v1");
-      return savedItems ? JSON.parse(savedItems) : [];
+      if (!savedItems) return [];
+      
+      const parsed = JSON.parse(savedItems);
+      if (!Array.isArray(parsed)) {
+        console.warn("Stored wardrobe is not an array, resetting.");
+        return [];
+      }
+
+      // Sanitize items to ensure mandatory array fields like 'style' and 'season' exist
+      // This prevents "Cannot read properties of undefined (reading 'length')" or similar errors
+      return parsed.map((item: any) => ({
+        ...item,
+        id: item.id || crypto.randomUUID(),
+        category: item.category || "Unknown",
+        color: item.color || "Unknown",
+        image: item.image || "",
+        season: Array.isArray(item.season) ? item.season : [],
+        style: Array.isArray(item.style) ? item.style : [],
+        description: item.description || ""
+      }));
     } catch (error) {
       console.error("Failed to load wardrobe from local storage:", error);
       return [];
