@@ -28,6 +28,9 @@ const OutfitGenerator: React.FC<OutfitGeneratorProps> = ({ wardrobe, onFindMissi
       const result = await generateOutfit(wardrobe, occasion, notes);
       setSuggestion(result);
       
+      // Stop the main "Styling..." spinner as the text result is ready
+      setIsGenerating(false);
+
       // Auto-trigger visualization
       setIsVisualizing(true);
       const image = await generateOutfitVisualization(result.description);

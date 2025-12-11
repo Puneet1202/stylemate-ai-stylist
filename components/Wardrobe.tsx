@@ -14,17 +14,31 @@ const COLORS = ['#A8A29E', '#78716C', '#57534E', '#D6D3D1', '#E7E5E4', '#F5F5F4'
 
 const Wardrobe: React.FC<WardrobeProps> = ({ items, onAddItem, onRemoveItem }) => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
 
     setIsAnalyzing(true);
-    try {
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        const base64String = reader.result as string;
+    setUploadProgress({ current: 0, total: files.length });
+
+    // Explicitly cast to File[] to avoid 'unknown' type inference issues
+    const fileArray: File[] = Array.from(files);
+
+    for (let i = 0; i < fileArray.length; i++) {
+      const file = fileArray[i];
+      // Update progress
+      setUploadProgress({ current: i + 1, total: fileArray.length });
+
+      try {
+        const base64String = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
         
         // Analyze with Gemini
         const analysis = await analyzeClothingImage(base64String);
@@ -40,15 +54,15 @@ const Wardrobe: React.FC<WardrobeProps> = ({ items, onAddItem, onRemoveItem }) =
         };
 
         onAddItem(newItem);
-      };
-      reader.readAsDataURL(file);
-    } catch (error) {
-      console.error("Failed to analyze image", error);
-      alert("Could not analyze the image. Please try again.");
-    } finally {
-      setIsAnalyzing(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      } catch (error) {
+        console.error(`Failed to analyze image ${file.name}`, error);
+        // We continue processing other files even if one fails
+      }
     }
+
+    setIsAnalyzing(false);
+    setUploadProgress(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   // Prepare chart data
@@ -75,6 +89,7 @@ const Wardrobe: React.FC<WardrobeProps> = ({ items, onAddItem, onRemoveItem }) =
         <div className="relative">
           <input
             type="file"
+            multiple
             ref={fileInputRef}
             onChange={handleFileUpload}
             accept="image/*"
@@ -83,17 +98,29 @@ const Wardrobe: React.FC<WardrobeProps> = ({ items, onAddItem, onRemoveItem }) =
           <button
             onClick={() => fileInputRef.current?.click()}
             disabled={isAnalyzing}
-            className="flex items-center gap-2 bg-stone-800 hover:bg-stone-900 text-white px-6 py-3 rounded-xl transition-all shadow-md disabled:opacity-70"
+            className="flex items-center gap-2 bg-stone-900 hover:bg-stone-800 text-white px-6 py-3 rounded-xl transition-all shadow-md disabled:opacity-70 disabled:cursor-wait"
           >
             {isAnalyzing ? (
               <Loader2 className="w-5 h-5 animate-spin" />
             ) : (
               <Plus className="w-5 h-5" />
             )}
-            {isAnalyzing ? 'Analyzing...' : 'Add Item'}
+            {isAnalyzing && uploadProgress 
+              ? `Analyzing ${uploadProgress.current}/${uploadProgress.total}...` 
+              : 'Add Items'}
           </button>
         </div>
       </div>
+
+      {/* Progress Indicator (Optional visual feedback below header) */}
+      {isAnalyzing && uploadProgress && (
+        <div className="w-full bg-stone-100 rounded-full h-1.5 overflow-hidden">
+          <div 
+            className="bg-stone-800 h-full transition-all duration-300 ease-out"
+            style={{ width: `${(uploadProgress.current / uploadProgress.total) * 100}%` }}
+          />
+        </div>
+      )}
 
       {/* Stats Section */}
       {items.length > 0 && (

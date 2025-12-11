@@ -1,219 +1,304 @@
-import { GoogleGenAI, Type } from "@google/genai";
-import { ClothingItem, OutfitSuggestion } from "../types";
+import { GoogleGenAI, Schema, Type } from "@google/genai";
+import { ClothingItem, StylistResponse, OutfitCardData, OutfitSuggestion } from "../types";
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// Helper to extract mime type and data from base64 string
-const getBase64Details = (base64String: string) => {
-  if (!base64String) {
-    console.warn("Empty base64 string provided to getBase64Details");
-    return { mimeType: "image/jpeg", data: "" };
-  }
-  const matches = base64String.match(/^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,(.+)$/);
-  if (matches && matches.length === 3) {
-    return {
-      mimeType: matches[1],
-      data: matches[2]
-    };
-  }
-  // Fallback if already stripped or invalid format (assume jpeg/raw)
-  return {
-    mimeType: "image/jpeg",
-    data: base64String.replace(/^data:image\/\w+;base64,/, "")
-  };
-};
-
-// Helper to safely parse JSON from AI response
-const safeJsonParse = (text: string) => {
-  try {
-    // Remove code blocks if present
-    const cleanedText = text.replace(/```json\n?|```/g, "").trim();
-    return JSON.parse(cleanedText);
-  } catch (e) {
-    console.error("JSON Parse Error:", e);
-    console.log("Raw Text:", text);
-    return null;
-  }
+const cleanBase64 = (base64: string) => base64.replace(/^data:image\/(png|jpeg|jpg|webp);base64,/, "");
+const getMimeType = (base64: string) => {
+  const match = base64.match(/^data:(image\/\w+);base64,/);
+  return match ? match[1] : 'image/jpeg';
 };
 
 // 1. Analyze Clothing Item
 export const analyzeClothingImage = async (base64Image: string): Promise<Partial<ClothingItem>> => {
-  try {
-    const { mimeType, data } = getBase64Details(base64Image);
-    if (!data) throw new Error("Invalid image data");
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      category: { type: Type.STRING },
+      color: { type: Type.STRING },
+      season: { type: Type.ARRAY, items: { type: Type.STRING } },
+      style: { type: Type.ARRAY, items: { type: Type.STRING } },
+      description: { type: Type.STRING },
+    },
+    required: ["category", "color", "season", "style", "description"],
+  };
 
+  try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: 'gemini-2.5-flash',
       contents: {
         parts: [
-          {
-            inlineData: {
-              mimeType: mimeType,
-              data: data,
-            },
-          },
-          {
-            text: `Analyze this clothing item. Identify the category (e.g., Shirt, Pants, Dress, Shoes), primary color, suitable seasons, and style tags (e.g., Casual, Formal, Streetwear). Return JSON.`,
-          },
-        ],
+          { inlineData: { mimeType: getMimeType(base64Image), data: cleanBase64(base64Image) } },
+          { text: "Analyze this clothing item. Categorize it (e.g., Shirt, Pants, Shoes), detect the color, season (Summer, Winter, All-Season, etc.), style (Casual, Formal, Streetwear, etc.), and provide a brief description." }
+        ]
       },
       config: {
         responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            category: { type: Type.STRING },
-            color: { type: Type.STRING },
-            season: { type: Type.ARRAY, items: { type: Type.STRING } },
-            style: { type: Type.ARRAY, items: { type: Type.STRING } },
-            description: { type: Type.STRING },
-          },
-        },
-      },
+        responseSchema: schema,
+      }
     });
 
-    const text = response.text;
-    if (!text) throw new Error("No response from AI");
-    
-    const parsed = safeJsonParse(text);
-    if (!parsed) throw new Error("Failed to parse AI response");
-    
-    // Sanitize response to ensure arrays exist
-    return {
-      category: parsed.category,
-      color: parsed.color,
-      season: Array.isArray(parsed.season) ? parsed.season : [],
-      style: Array.isArray(parsed.style) ? parsed.style : [],
-      description: parsed.description
-    };
+    const result = JSON.parse(response.text || "{}");
+    return result;
   } catch (error) {
-    console.error("Error analyzing image:", error);
-    throw new Error("Failed to analyze image with Gemini. Please try again.");
+    console.error("Analysis failed", error);
+    return {
+      category: "Unknown",
+      color: "Unknown",
+      style: ["Casual"],
+      season: ["All-Year"],
+      description: "Could not analyze item."
+    };
   }
 };
 
-// 2. Generate Outfit Suggestion
+// 2. Search for Items (Shopping Tab Helper)
+export const searchForItems = async (query: string) => {
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: `Find fashion items for: ${query} in India.`,
+      config: {
+        tools: [{ googleSearch: {} }]
+      }
+    });
+    
+    return {
+      text: response.text || "No results found.",
+      groundingChunks: response.candidates?.[0]?.groundingMetadata?.groundingChunks || []
+    };
+  } catch (error) {
+    console.error("Search failed", error);
+    return {
+        text: "Search unavailable.",
+        groundingChunks: []
+    };
+  }
+};
+
+// 3. Strict Wardrobe-First Stylist Logic
+export const generateStylistResponse = async (
+  message: string,
+  wardrobe: ClothingItem[],
+  history: any[]
+): Promise<StylistResponse> => {
+  
+  const wardrobeDesc = wardrobe.map(item => `ID: ${item.id} - ${item.color} ${item.category} (${item.style.join(', ')})`).join('\n');
+  const historyText = history.map(h => `${h.role}: ${h.content}`).join('\n');
+  const hasItems = wardrobe.length > 0;
+
+  const prompt = `
+    You are "AI Style Mate", a personal fashion stylist.
+
+    STRICT RULES YOU MUST FOLLOW:
+    1. ALWAYS analyze ALL items in the wardrobe first
+    2. Match clothing formality to the occasion:
+       - Night Party/Wedding/Formal Event → MUST use SUIT or most formal items first
+       - Business Meeting → Use Suit or Jacket + Formal Shirt
+       - Casual Hangout/College → Use Casual Shirts and Jackets
+       - Date/Dinner → Use Jacket + Nice Shirt combination
+    3. NEVER ignore Suits or Formal wear when user mentions parties, weddings, or formal events
+    4. You MUST create outfit from EXISTING wardrobe items ONLY
+    5. After suggesting outfit from wardrobe, then recommend additional items to buy
+
+    CURRENT USER'S WARDROBE ITEMS (Use these IDs):
+    ${hasItems ? wardrobeDesc : "User's wardrobe is empty."}
+
+    USER REQUEST: "${message}"
+
+    CONVERSATION HISTORY:
+    ${historyText}
+
+    RESPONSE FORMAT (Follow this EXACTLY):
+
+    🎯 **PERFECT OUTFIT FROM YOUR WARDROBE:**
+
+    👔 **TOP:** [Specific item from wardrobe with color]
+    👖 **BOTTOM:** [Specific item from wardrobe OR write "Need to buy pants" if none match]
+    🧥 **LAYER/JACKET:** [If suit or jacket available and fits occasion, mention here]
+
+    ✨ **Why This Works:**
+    [Write 2-3 lines explaining why this combination is perfect for the specific occasion]
+
+    ---
+
+    🛍️ **ITEMS TO BUY TO COMPLETE THE LOOK:**
+
+    1. 👞 **[Item Name - be specific like "Black Leather Oxford Shoes"]**
+       💰 **Price:** ₹[X,XXX - X,XXX]
+       🏪 **BUY HERE (Click links):**
+       • https://www.myntra.com/search?q=[URL_Encoded_Item_Name]
+       • https://www.ajio.com/search/?text=[URL_Encoded_Item_Name]
+       • https://www.amazon.in/s?k=[URL_Encoded_Item_Name]
+
+    2. ⌚ **[Item Name - like "Silver Minimalist Watch"]**
+       💰 **Price:** ₹[X,XXX - X,XXX]
+       🏪 **BUY HERE (Click links):**
+       • https://www.myntra.com/search?q=[URL_Encoded_Item_Name]
+       • https://www.amazon.in/s?k=[URL_Encoded_Item_Name]
+
+    3. 🎒 **[If needed - like "Black Leather Belt" or accessories]**
+       💰 **Price:** ₹[X,XXX - X,XXX]
+       🏪 **BUY HERE (Click links):**
+       • https://www.myntra.com/search?q=[URL_Encoded_Item_Name]
+       • https://www.amazon.in/s?k=[URL_Encoded_Item_Name]
+
+    ---
+
+    📌 **PINTEREST INSPIRATION - CLICK TO SEE OUTFIT PICTURES:**
+
+    🔍 **Search 1:** "[Specific outfit description with colors and style]"
+    🔗 **CLICK HERE:** https://in.pinterest.com/search/pins/?q=[search+terms+joined+by+plus]
+
+    🔍 **Search 2:** "[Another style variation or angle]"
+    🔗 **CLICK HERE:** https://in.pinterest.com/search/pins/?q=[search+terms+joined+by+plus]
+
+    🔍 **Search 3:** "[Styling details or accessories focus]"
+    🔗 **CLICK HERE:** https://in.pinterest.com/search/pins/?q=[search+terms+joined+by+plus]
+
+    🔍 **Search 4:** "[Footwear or complete look inspiration]"
+    🔗 **CLICK HERE:** https://in.pinterest.com/search/pins/?q=[search+terms+joined+by+plus]
+
+    🔍 **Search 5:** "[Color combination or seasonal styling]"
+    🔗 **CLICK HERE:** https://in.pinterest.com/search/pins/?q=[search+terms+joined+by+plus]
+
+    ---
+
+    💡 **PRO STYLING TIP:**
+    [Give one specific, actionable styling tip relevant to the occasion]
+
+    ---
+
+    CRITICAL REMINDERS:
+    - For queries with "party", "night party", "wedding" → Suit is TOP PRIORITY
+    - For "college", "casual" → Casual shirts and jackets
+    - Always provide 5 Pinterest links with different search angles
+    - Make all shopping links clickable and specific using search queries
+    - Use emojis to make response visually appealing
+    - Be conversational and friendly in tone
+
+    OUTPUT JSON STRUCTURE:
+    {
+      "message": "The full formatted markdown text following the RESPONSE FORMAT",
+      "selectedItemIds": ["id1", "id2", "id3"],
+      "suggestions": ["Next quick reply option 1", "Option 2"]
+    }
+  `;
+
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      message: { type: Type.STRING },
+      selectedItemIds: { type: Type.ARRAY, items: { type: Type.STRING } },
+      suggestions: { type: Type.ARRAY, items: { type: Type.STRING } }
+    },
+    required: ["message", "selectedItemIds", "suggestions"]
+  };
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: schema
+      }
+    });
+
+    const result = JSON.parse(response.text || "{}");
+    
+    // Map to StylistResponse type expected by the app
+    // We create a dummy "outfit" object to hold the selectedItemIds so the UI can verify them
+    const outfits: OutfitCardData[] = [{
+        id: 'generated-outfit',
+        title: 'Your Outfit',
+        description: 'Generated from wardrobe',
+        matchScore: 100,
+        selectedItemIds: result.selectedItemIds || [],
+        missingItems: [],
+        pinterestLooks: [],
+        reasoning: ''
+    }];
+
+    return {
+      mode: 'wardrobe_outfit',
+      message: result.message || "Here is a suggestion.",
+      outfits: outfits,
+      suggestions: result.suggestions || []
+    };
+
+  } catch (error) {
+    console.error("Stylist generation failed", error);
+    return {
+      mode: 'wardrobe_outfit',
+      message: "Network issue hai! Try again later.",
+      outfits: [],
+      suggestions: ["Try again"]
+    };
+  }
+};
+
+// 4. Generate Specific Outfit (for OutfitGenerator)
 export const generateOutfit = async (
   wardrobe: ClothingItem[],
   occasion: string,
   notes: string
 ): Promise<OutfitSuggestion> => {
-  if (wardrobe.length === 0) {
-      throw new Error("Wardrobe is empty");
+  if (!wardrobe.length) {
+    throw new Error("Wardrobe is empty");
   }
 
-  const inventoryDescription = wardrobe
-    .map((item) => `- ID: ${item.id}, ${item.color} ${item.category} (${(item.style || []).join(", ")})`)
-    .join("\n");
-
+  const wardrobeDesc = wardrobe.map(item => `ID: ${item.id} - ${item.color} ${item.category} (${item.style.join(', ')})`).join('\n');
+  
   const prompt = `
-    I need an outfit for: ${occasion}.
-    Additional notes: ${notes}.
+    You are a fashion stylist. 
+    User Occasion: "${occasion}"
+    User Notes: "${notes}"
     
-    Here is my current wardrobe inventory:
-    ${inventoryDescription}
+    User's Wardrobe:
+    ${wardrobeDesc}
     
-    Please suggest the best outfit using my items. You can also suggest *one or two* missing items I should buy to complete the look if necessary.
+    Select the best outfit from the wardrobe for this occasion.
+    If pieces are missing to complete the look, list them.
     
-    Return the result in strict JSON format matching this structure:
-    {
-      "outfitName": "A catchy name for the look",
-      "description": "A vivid description of the outfit styling",
-      "selectedItemIds": ["id1", "id2"],
-      "missingItems": ["description of missing item 1"],
-      "reasoning": "Why this works for the occasion"
-    }
+    Return JSON.
   `;
+
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      outfitName: { type: Type.STRING },
+      description: { type: Type.STRING },
+      reasoning: { type: Type.STRING },
+      selectedItemIds: { type: Type.ARRAY, items: { type: Type.STRING } },
+      missingItems: { type: Type.ARRAY, items: { type: Type.STRING } }
+    },
+    required: ["outfitName", "description", "reasoning", "selectedItemIds", "missingItems"]
+  };
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
         responseMimeType: "application/json",
-        // Using a schema ensures strict adherence
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            outfitName: { type: Type.STRING },
-            description: { type: Type.STRING },
-            selectedItemIds: { type: Type.ARRAY, items: { type: Type.STRING } },
-            missingItems: { type: Type.ARRAY, items: { type: Type.STRING } },
-            reasoning: { type: Type.STRING },
-          },
-        },
-      },
-    });
-
-    const text = response.text;
-    if (!text) throw new Error("No response from AI");
-    
-    const parsed = safeJsonParse(text);
-    if (!parsed) throw new Error("Failed to parse outfit suggestion");
-    
-    // Sanitize response to ensure mandatory arrays are present
-    const result: OutfitSuggestion = {
-      outfitName: parsed.outfitName || "Outfit Suggestion",
-      description: parsed.description || "No description provided.",
-      selectedItemIds: Array.isArray(parsed.selectedItemIds) ? parsed.selectedItemIds : [],
-      missingItems: Array.isArray(parsed.missingItems) ? parsed.missingItems : [],
-      reasoning: parsed.reasoning || "Based on your wardrobe choices."
-    };
-
-    return result;
-  } catch (error) {
-    console.error("Error generating outfit:", error);
-    throw new Error("Failed to generate outfit suggestion. Please try again.");
-  }
-};
-
-// 3. Generate Outfit Visualization
-export const generateOutfitVisualization = async (description: string): Promise<string | null> => {
-  try {
-    // Using gemini-2.5-flash-image for generation
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-image",
-      contents: {
-        parts: [
-          {
-            text: `Create a high-fashion, pinterest-style flatlay or lifestyle photography of this outfit: ${description}. Clean lighting, aesthetic background.`,
-          },
-        ],
-      },
-    });
-
-    // Extract image from response parts
-    if (response.candidates && response.candidates.length > 0 && response.candidates[0].content && response.candidates[0].content.parts) {
-      for (const part of response.candidates[0].content.parts) {
-        if (part.inlineData) {
-          return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-        }
+        responseSchema: schema
       }
-    }
-    return null;
+    });
+    return JSON.parse(response.text || "{}") as OutfitSuggestion;
   } catch (error) {
-    console.error("Error generating image:", error);
-    return null;
+    console.error("Generate outfit failed", error);
+    return {
+      outfitName: "Error generating outfit",
+      description: "Please try again.",
+      reasoning: "",
+      selectedItemIds: [],
+      missingItems: []
+    };
   }
 };
 
-// 4. Shopping Assistant with Search Grounding
-export const searchForItems = async (query: string) => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Find shopping links for: ${query}. Return a list of 3-5 distinct specific items available for purchase online.`,
-      config: {
-        tools: [{ googleSearch: {} }],
-      },
-    });
-
-    const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-    const text = response.text || "I couldn't find specific shopping results.";
-    
-    return { text, groundingChunks };
-  } catch (error) {
-    console.error("Error searching items:", error);
-    throw new Error("Failed to search for items.");
-  }
+export const generateOutfitVisualization = async (description: string): Promise<string | null> => {
+    // Visualization is optional/mocked for now to satisfy interface
+    return null;
 };
